@@ -1,119 +1,90 @@
-# taby - TeamSpeak Audio Bot YouTube
+# Taby
 
-A bash script that creates a virtual audio pipeline to stream YouTube audio to TeamSpeak and optionally provides RTSP/HTTP streaming capabilities.
+Taby is a script that creates a virtual audio pipeline for streaming YouTube audio to TeamSpeak and optionally to RTSP/HTTP streams.
 
 ## Features
 
-- Stream YouTube audio directly to TeamSpeak using a virtual microphone
-- Optional RTSP streaming for media players
-- Optional HTTP streaming for web browsers
-- Automatic handling of YouTube URLs with yt-dlp
-- Clean termination and resource cleanup
+- Creates virtual audio devices for TeamSpeak integration
+- Streams YouTube audio to TeamSpeak channels
+- Optional RTSP streaming (default port 8554)
+- Optional HTTP streaming with browser player (default port 8080)
+- Uses yt-dlp to extract direct audio streams from YouTube URLs
 
 ## Requirements
 
 - Linux with PulseAudio
 - VLC media player
-- yt-dlp
-- TeamSpeak client
+- yt-dlp (will be automatically installed if missing)
 
 ## Installation
 
-1. Make sure you have the required dependencies:
+1. Clone this repository:
    ```
-   sudo apt install vlc pulseaudio
-   ```
-
-2. Install yt-dlp:
-   ```
-   sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-   sudo chmod a+rx /usr/local/bin/yt-dlp
+   git clone https://github.com/cheeeee/taby.git
+   cd taby
    ```
 
-3. Clone this repository or download the script file
-
-4. Make the script executable:
+2. Make the script executable:
    ```
-   chmod +x ts_youtube_bot.sh
+   chmod +x taby.py
    ```
 
 ## Usage
 
-### Basic Usage
+The script requires at least a YouTube URL as input and accepts several options:
 
 ```
-./ts_youtube_bot.sh  [options]
+./taby.py [YouTube URL] [options]
 ```
 
 ### Options
 
-- `--rtsp-port PORT` - Enable RTSP streaming on specified port (default: 8554)
-- `--http-port PORT` - Enable HTTP streaming on specified port (default: 8080)
+- `--rtsp-port PORT` - Enable RTSP streaming on specified port
+- `--http-port PORT` - Enable HTTP streaming on specified port
 - `--no-streaming` - Disable all streaming (TeamSpeak only mode)
 
 ### Examples
 
-1. TeamSpeak only (no streaming):
-   ```
-   ./ts_youtube_bot.sh https://www.youtube.com/watch?v=example --no-streaming
-   ```
+```
+# TeamSpeak only (no streaming)
+./taby.py https://www.youtube.com/watch?v=example --no-streaming
 
-2. With RTSP streaming:
-   ```
-   ./ts_youtube_bot.sh https://www.youtube.com/watch?v=example --rtsp-port 8554
-   ```
+# TeamSpeak + RTSP streaming
+./taby.py https://www.youtube.com/watch?v=example --rtsp-port 8554
 
-3. With HTTP streaming for browsers:
-   ```
-   ./ts_youtube_bot.sh https://www.youtube.com/watch?v=example --http-port 8080
-   ```
+# TeamSpeak + HTTP streaming
+./taby.py https://www.youtube.com/watch?v=example --http-port 8080
 
-4. With both streaming options:
-   ```
-   ./ts_youtube_bot.sh https://www.youtube.com/watch?v=example --rtsp-port 8554 --http-port 8080
-   ```
+# TeamSpeak + RTSP + HTTP streaming
+./taby.py https://www.youtube.com/watch?v=example --rtsp-port 8554 --http-port 8080
+```
+
+## How It Works
+
+1. The script creates virtual PulseAudio devices (sink and source)
+2. It extracts the direct audio stream URL from YouTube using yt-dlp
+3. VLC is used to play the audio through the virtual sink
+4. If enabled, additional VLC instances are started for RTSP/HTTP streaming
+5. For HTTP streaming, it generates an HTML player page at `/tmp/audio_player.html`
 
 ## TeamSpeak Setup
 
-1. Start the script with your desired YouTube URL
-2. In TeamSpeak, go to Settings → Options → Capture
-3. Select "TS_Music_Bot" as your microphone input
-4. Adjust the volume as needed
+1. In TeamSpeak, go to Settings → Options → Capture
+2. Select "taby_source" as your capture device
+3. Configure other settings as needed
 
-## Streaming
+## Accessing Streams
 
-### RTSP Streaming
-
-If RTSP streaming is enabled, you can connect to the stream using VLC or other media players:
-```
-rtsp://your-ip-address:8554/audio
-```
-
-### HTTP Streaming
-
-If HTTP streaming is enabled:
-1. Open a web browser
-2. Navigate to `http://your-ip-address:8080/stream.ogg`
-3. Alternatively, open the HTML player created at `/tmp/audio_player.html`
+- RTSP stream: `rtsp://your-ip-address:8554/audio`
+- HTTP stream: `http://your-ip-address:8080/` (opens player in browser)
 
 ## Troubleshooting
 
-### RTSP Streaming Issues
+If you encounter issues:
 
-If you encounter errors with RTSP streaming related to "unsupported codec: mp3", the script automatically uses MPGA codec instead which is compatible with VLC's RTP implementation.
-
-### YouTube Download Problems
-
-If yt-dlp fails to download from YouTube:
-1. Update yt-dlp: `yt-dlp -U`
-2. Try a different format: `yt-dlp --list-formats `
-3. Check if the video is region-restricted or private
-
-### Audio Quality Issues
-
-If audio quality is poor:
-1. Increase network caching: Edit the script and increase the `--network-caching` value
-2. Increase bitrate: Edit the script and increase the `ab=128` value in the transcode options
+1. Make sure VLC is installed and accessible in your PATH
+2. Check that PulseAudio is running and functioning correctly
+3. Verify that the YouTube URL is valid and accessible
 
 ## License
 
