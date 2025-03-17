@@ -1,82 +1,126 @@
-# Taby - YouTube to TeamSpeak Audio Streaming
+# Taby - TeamSpeak YouTube Audio Streamer
 
-## Overview
-Taby is a set of Bash scripts that create a virtual audio pipeline to stream YouTube audio to TeamSpeak and optionally to RTSP/HTTP streams. It allows you to play music or other audio content from YouTube directly through your TeamSpeak microphone input, making it easy to share audio with friends in your TeamSpeak server.
+Taby is a versatile tool that allows you to stream YouTube audio to TeamSpeak and other applications through virtual audio devices. It creates a seamless audio pipeline that can be used for sharing music with friends in TeamSpeak or streaming audio content to other applications.
 
 ## Features
-- Stream YouTube audio directly to TeamSpeak via virtual audio devices
-- Optional RTSP streaming for media players
-- Optional HTTP streaming with browser-based player
-- Custom naming of audio devices for easy identification
-- Multiple concurrent streams with the controller script
 
-## Components
-- **taby.sh**: The main script that handles a single YouTube stream
-- **taby-controller.sh**: A management script that can handle multiple streams simultaneously
+- Stream YouTube audio directly to TeamSpeak
+- Create virtual audio devices for routing audio
+- Support for RTSP and HTTP streaming
+- Multiple concurrent streams with the controller
+- Queue management for sequential playback
+- Interactive command-line interface
 
-## Requirements
-- Linux with PulseAudio
+## Prerequisites
+
+Taby requires the following dependencies:
 - VLC media player
-- yt-dlp (YouTube downloader)
+- PulseAudio
+- yt-dlp
+- Python 3 (for the controller)
 - curl
-- jq
 
 ## Installation
-1. Clone the repository or download the scripts
-2. Make the scripts executable: `chmod +x taby.sh taby-controller.sh`
-3. Ensure all dependencies are installed
+
+You can quickly install all dependencies using the provided installation script:
+
+```bash
+sudo ./install.sh
+```
+
+This will install all required packages on Debian-based Linux distributions.
 
 ## Usage
 
 ### Basic Usage
+
+To stream a YouTube video's audio:
+
 ```bash
-./taby.sh https://www.youtube.com/watch?v=example
+./taby.sh 
 ```
+
+This will create virtual audio devices and start streaming. Select the created virtual source (default: `TS_Music_Bot`) as your microphone in TeamSpeak.
 
 ### Advanced Options
+
 ```bash
-./taby.sh https://www.youtube.com/watch?v=example --rtsp-port 8554 --http-port 8080 --sink-name custom_sink --source-name custom_source
+./taby.sh  [--rtsp-port PORT] [--http-port PORT] [--no-streaming] [--sink-name NAME] [--source-name NAME]
 ```
 
-### Using the Controller
+- `--rtsp-port PORT`: Set custom RTSP streaming port (default: 8554)
+- `--http-port PORT`: Set custom HTTP streaming port (default: 8080)
+- `--no-streaming`: Disable RTSP and HTTP streaming
+- `--sink-name NAME`: Custom name for the PulseAudio sink (max 15 chars)
+- `--source-name NAME`: Custom name for the virtual microphone (max 15 chars)
+
+## Taby Controller
+
+The controller allows you to manage multiple Taby instances simultaneously, providing a queue system and interactive interface.
+
+### Controller Usage
+
 ```bash
-# Start with a single URL
-./taby-controller.sh -u https://www.youtube.com/watch?v=example
-
-# Use a playlist file
-./taby-controller.sh -p my_playlist.txt --max-concurrent 3
-
-# Interactive commands
-taby-controller> add https://www.youtube.com/watch?v=example
-taby-controller> list
-taby-controller> next
-taby-controller> stop 0
-taby-controller> stop-all
+./taby-controller.py [options]
 ```
 
-## Configuration Options
+Options:
+- `-p, --playlist FILE`: Load YouTube URLs from a playlist file
+- `-u, --url URL`: Add YouTube URL to queue (can be used multiple times)
+- `-s, --script PATH`: Path to taby.sh (default: ./taby.sh)
+- `-l, --list`: List active instances
+- `--rtsp-base-port PORT`: Base port for RTSP streaming (default: 8554)
+- `--http-base-port PORT`: Base port for HTTP streaming (default: 8080)
+- `--port-increment N`: Port increment for each instance (default: 10)
+- `--max-concurrent N`: Maximum concurrent instances (default: 5)
+- `--log-dir DIR`: Log directory (default: /tmp/taby-controller-logs)
+- `--db-file FILE`: Database file (default: /tmp/taby-controller.db)
 
-### taby.sh
-- `--rtsp-port PORT`: Set RTSP streaming port (default: 8554)
-- `--http-port PORT`: Set HTTP streaming port (default: 8080)
-- `--no-streaming`: Disable all streaming (TeamSpeak only mode)
-- `--sink-name NAME`: Custom name for the virtual sink
-- `--source-name NAME`: Custom name for the virtual microphone
+### Interactive Commands
 
-### taby-controller.sh
-- `-u, --url URL`: Add a single YouTube URL to the queue
-- `-p, --playlist FILE`: Specify a playlist file with YouTube URLs
-- `-s, --script PATH`: Path to the taby.sh script
-- `--rtsp-base-port PORT`: Base port for RTSP streaming
-- `--http-base-port PORT`: Base port for HTTP streaming
-- `--port-increment NUM`: Port increment for each instance
-- `--max-concurrent NUM`: Maximum number of concurrent instances
-- `--log-dir DIR`: Directory for log files
+Once the controller is running, you can use these commands:
+- `list`: Show active Taby instances
+- `stop ID`: Stop a specific instance
+- `stop-all`: Stop all instances
+- `start-next`: Start the next URL in queue
+- `add URL`: Add a YouTube URL to the queue
+- `clean`: Remove dead instances
+- `queue`: Show the current URL queue
+- `help`: Display available commands
+- `exit` or `quit`: Exit the controller
 
-## TeamSpeak Setup
-In TeamSpeak, select the custom virtual microphone source as your input device. If you don't see the custom name, you may need to use pavucontrol to redirect the audio input for TeamSpeak.
+## Examples
 
-## Notes
-- Device names are limited to 15 characters for compatibility
-- HTTP streaming creates an HTML player at /tmp/audio_player.html
-- The controller script provides a convenient way to manage multiple streams
+### Basic streaming
+```bash
+./taby.sh https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+### Custom device names
+```bash
+./taby.sh https://www.youtube.com/watch?v=dQw4w9WgXcQ --sink-name music_sink --source-name Music_Bot
+```
+
+### Using the controller with a playlist
+```bash
+./taby-controller.py --playlist my_playlist.txt --max-concurrent 3
+```
+
+## How It Works
+
+1. Taby creates a virtual audio sink and source using PulseAudio
+2. It uses yt-dlp to extract the audio stream URL from YouTube
+3. VLC plays the audio and routes it to the virtual sink
+4. The virtual source captures this audio for use in TeamSpeak
+5. Optional RTSP/HTTP streaming allows remote access to the audio
+
+## Troubleshooting
+
+- If audio is not playing, check that all dependencies are installed correctly
+- Verify that PulseAudio is running with `pulseaudio --check`
+- Make sure you've selected the correct virtual source in TeamSpeak
+- Check logs in the controller's log directory for detailed error information
+
+## License
+
+This project is open-source software.
