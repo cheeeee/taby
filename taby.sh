@@ -17,16 +17,22 @@ SOURCE_NAME="$DEFAULT_SOURCE_NAME"
 
 # Display usage information
 show_usage() {
-    echo "Usage: $0  [options]"
+    echo "Usage: $0 <youtube_url> [options]"
     echo "Options:"
-    echo "  --rtsp-port PORT    Enable RTSP streaming on specified port (default: 8554)"
-    echo "  --http-port PORT    Enable HTTP streaming on specified port (default: 8080)"
-    echo "  --no-streaming      Disable all streaming (TeamSpeak only mode)"
-    echo "  --sink-name NAME    Custom name for the virtual sink (default: ts_music_sink)"
-    echo "  --source-name NAME  Custom name for the virtual microphone (default: TS_Music_Bot)"
+    echo "  -h, --help           Show this help message"
+    echo "  --rtsp-port PORT     Enable RTSP streaming on specified port (default: 8554)"
+    echo "  --http-port PORT     Enable HTTP streaming on specified port (default: 8080)"
+    echo "  --no-streaming       Disable all streaming (TeamSpeak only mode)"
+    echo "  --sink-name NAME     Custom name for the virtual sink (default: ts_music_sink)"
+    echo "  --source-name NAME   Custom name for the virtual microphone (default: TS_Music_Bot)"
     echo "Example: $0 https://www.youtube.com/watch?v=example --rtsp-port 8554 --http-port 8080"
     exit 1
 }
+
+# Check for help flag first
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    show_usage
+fi
 
 # Check if a YouTube URL was provided
 if [ $# -lt 1 ]; then
@@ -91,6 +97,16 @@ else
     echo "Streaming is disabled (TeamSpeak only mode)"
 fi
 
+# Ensure sink name is not too long (max 15 chars)
+if [ ${#SINK_NAME} -gt 15 ]; then
+    SINK_NAME="${SINK_NAME:0:15}"
+fi
+
+# Ensure source name is not too long (max 15 chars)
+if [ ${#SOURCE_NAME} -gt 15 ]; then
+    SOURCE_NAME="${SOURCE_NAME:0:15}"
+fi
+
 # Create virtual audio devices
 echo "Creating virtual audio devices..."
 SINK_ID=$(pactl load-module module-null-sink sink_name=$SINK_NAME sink_properties=device.description=$SINK_NAME)
@@ -100,6 +116,7 @@ if [ -z "$SINK_ID" ]; then
 fi
 
 # Create a virtual microphone source that uses the monitor of the sink
+# Important: We set both source_name and device.description to $SOURCE_NAME so it appears correctly in TeamSpeak
 VIRTUAL_MIC_ID=$(pactl load-module module-virtual-source source_name=$SOURCE_NAME master=$SINK_NAME.monitor source_properties=device.description=$SOURCE_NAME)
 if [ -z "$VIRTUAL_MIC_ID" ]; then
     echo "Failed to create virtual microphone. Cleaning up."
@@ -200,11 +217,12 @@ if [ "$ENABLE_STREAMING" = true ] && [ -n "$HTTP_PORT" ]; then
         echo "✓ Open this URL in your web browser to listen to the stream"
         
         # Create a simple HTML player file for easy access
-        cat > /tmp/audio_player.html 
-
-
-    Audio Stream Player
-    
+        cat > /tmp/audio_player.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Audio Stream Player</title>
+    <style>
         body {
             font-family: Arial, sans-serif;
             max-width: 800px;
@@ -222,23 +240,23 @@ if [ "$ENABLE_STREAMING" = true ] && [ -n "$HTTP_PORT" ]; then
             border-radius: 5px;
             margin-top: 20px;
         }
+    </style>
+</head>
+<body>
+    <h1>YouTube Audio Stream</h1>
     
-
-
-    YouTube Audio Stream
-    
-    
-        
+    <audio controls autoplay>
+        <source src="http://$LOCAL_IP:$HTTP_PORT/stream.ogg" type="audio/ogg">
         Your browser does not support the audio element.
+    </audio>
     
-    
-    
+    <div class="info">
         If you can't hear audio, try opening the direct URL in VLC or another media player:
-        http://$LOCAL_IP:$HTTP_PORT/stream.ogg
-        $([ -n "$RTSP_PORT" ] && echo "RTSP URL (for media players): rtsp://$LOCAL_IP:$RTSP_PORT$RTSP_PATH")
-    
-
-
+        <br>http://$LOCAL_IP:$HTTP_PORT/stream.ogg
+        <br>$([ -n "$RTSP_PORT" ] && echo "RTSP URL (for media players): rtsp://$LOCAL_IP:$RTSP_PORT$RTSP_PATH")
+    </div>
+</body>
+</html>
 EOF
         echo "✓ Created HTML player at /tmp/audio_player.html"
         echo "✓ Open this file in a browser to access the player"
