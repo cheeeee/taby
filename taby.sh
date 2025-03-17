@@ -7,6 +7,14 @@ if ! command -v yt-dlp &> /dev/null; then
     exit 1
 fi
 
+# Default device names
+DEFAULT_SINK_NAME="ts_music_sink"
+DEFAULT_SOURCE_NAME="TS_Music_Bot"
+
+# Variables to hold actual device names
+SINK_NAME="$DEFAULT_SINK_NAME"
+SOURCE_NAME="$DEFAULT_SOURCE_NAME"
+
 # Display usage information
 show_usage() {
     echo "Usage: $0  [options]"
@@ -14,6 +22,8 @@ show_usage() {
     echo "  --rtsp-port PORT    Enable RTSP streaming on specified port (default: 8554)"
     echo "  --http-port PORT    Enable HTTP streaming on specified port (default: 8080)"
     echo "  --no-streaming      Disable all streaming (TeamSpeak only mode)"
+    echo "  --sink-name NAME    Custom name for the virtual sink (default: ts_music_sink)"
+    echo "  --source-name NAME  Custom name for the virtual microphone (default: TS_Music_Bot)"
     echo "Example: $0 https://www.youtube.com/watch?v=example --rtsp-port 8554 --http-port 8080"
     exit 1
 }
@@ -34,6 +44,9 @@ ENABLE_STREAMING=true
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            show_usage
+            ;;
         --rtsp-port)
             RTSP_PORT="$2"
             shift 2
@@ -45,6 +58,14 @@ while [[ $# -gt 0 ]]; do
         --no-streaming)
             ENABLE_STREAMING=false
             shift
+            ;;
+        --sink-name)
+            SINK_NAME="$2"
+            shift 2
+            ;;
+        --source-name)
+            SOURCE_NAME="$2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"
@@ -72,21 +93,21 @@ fi
 
 # Create virtual audio devices
 echo "Creating virtual audio devices..."
-SINK_ID=$(pactl load-module module-null-sink sink_name=ts_music_sink sink_properties=device.description=TS_Music_Sink)
+SINK_ID=$(pactl load-module module-null-sink sink_name=$SINK_NAME sink_properties=device.description=$SINK_NAME)
 if [ -z "$SINK_ID" ]; then
     echo "Failed to create virtual sink. Exiting."
     exit 1
 fi
 
 # Create a virtual microphone source that uses the monitor of the sink
-VIRTUAL_MIC_ID=$(pactl load-module module-virtual-source source_name=TS_Music_Bot master=ts_music_sink.monitor source_properties=device.description=TS_Music_Bot)
+VIRTUAL_MIC_ID=$(pactl load-module module-virtual-source source_name=$SOURCE_NAME master=$SINK_NAME.monitor source_properties=device.description=$SOURCE_NAME)
 if [ -z "$VIRTUAL_MIC_ID" ]; then
     echo "Failed to create virtual microphone. Cleaning up."
     pactl unload-module "$SINK_ID" 2>/dev/null || true
     exit 1
 fi
 
-echo "Virtual microphone created: TS_Music_Bot"
+echo "Virtual microphone created: $SOURCE_NAME"
 
 # Cleanup function
 cleanup() {
@@ -128,7 +149,7 @@ fi
 echo "Starting VLC with direct stream URL..."
 
 # Start VLC with the direct stream URL and route audio to the virtual sink
-PULSE_SINK=ts_music_sink cvlc --no-video --volume=256 --audio --audio-visual=visual --effect-list=spectrum --network-caching=10000 "$STREAM_URL" &
+PULSE_SINK=$SINK_NAME cvlc --no-video --volume=256 --audio --audio-visual=visual --effect-list=spectrum --network-caching=10000 "$STREAM_URL" &
 VLC_PID=$!
 
 echo "VLC started with PID: $VLC_PID"
@@ -141,18 +162,18 @@ if ! ps -p "$VLC_PID" >/dev/null 2>&1; then
 fi
 
 # Ensure the sink is not muted and set to 100% volume
-pactl set-sink-volume ts_music_sink 100%
-pactl set-sink-mute ts_music_sink 0
+pactl set-sink-volume $SINK_NAME 100%
+pactl set-sink-mute $SINK_NAME 0
 
 # Ensure the virtual mic is not muted and set to 100% volume
-pactl set-source-volume TS_Music_Bot 100%
-pactl set-source-mute TS_Music_Bot 0
+pactl set-source-volume $SOURCE_NAME 100%
+pactl set-source-mute $SOURCE_NAME 0
 
 # Start RTSP streaming if enabled
 if [ "$ENABLE_STREAMING" = true ] && [ -n "$RTSP_PORT" ]; then
     echo "Starting RTSP server on port $RTSP_PORT..."
     # Using mpga instead of mp3 for RTSP compatibility
-    cvlc -vvv pulse://ts_music_sink.monitor --sout "#transcode{acodec=mpga,ab=128,channels=2}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}" --sout-keep &
+    cvlc -vvv pulse://$SINK_NAME.monitor --sout "#transcode{acodec=mpga,ab=128,channels=2}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}" --sout-keep &
     RTSP_VLC_PID=$!
 
     # Verify RTSP VLC process started correctly
@@ -167,7 +188,7 @@ fi
 # Start HTTP streaming if enabled
 if [ "$ENABLE_STREAMING" = true ] && [ -n "$HTTP_PORT" ]; then
     echo "Starting HTTP streaming server on port $HTTP_PORT..."
-    cvlc -vvv pulse://ts_music_sink.monitor --sout "#transcode{vcodec=theo,vb=800,acodec=vorb,ab=128,channels=2}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}" --sout-keep &
+    cvlc -vvv pulse://$SINK_NAME.monitor --sout "#transcode{vcodec=theo,vb=800,acodec=vorb,ab=128,channels=2}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}" --sout-keep &
     HTTP_VLC_PID=$!
 
     # Verify HTTP VLC process started correctly
@@ -206,8 +227,10 @@ if [ "$ENABLE_STREAMING" = true ] && [ -n "$HTTP_PORT" ]; then
 
     YouTube Audio Stream
     
+    
         
         Your browser does not support the audio element.
+    
     
     
         If you can't hear audio, try opening the direct URL in VLC or another media player:
@@ -223,7 +246,7 @@ EOF
 fi
 
 echo "✓ Audio pipeline setup complete!"
-echo "✓ In TeamSpeak, select 'TS_Music_Bot' as your microphone input"
+echo "✓ In TeamSpeak, select '$SOURCE_NAME' as your microphone input"
 echo "✓ YouTube audio is now available for streaming to your TeamSpeak channel"
 echo "✓ Press Ctrl+C to stop."
 
@@ -236,13 +259,13 @@ while true; do
     
     if [ "$ENABLE_STREAMING" = true ] && [ -n "$RTSP_PORT" ] && [ -n "$RTSP_VLC_PID" ] && ! ps -p "$RTSP_VLC_PID" >/dev/null 2>&1; then
         echo "RTSP streaming terminated unexpectedly. Restarting..."
-        cvlc -vvv pulse://ts_music_sink.monitor --sout "#transcode{acodec=mpga,ab=128,channels=2}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}" --sout-keep &
+        cvlc -vvv pulse://$SINK_NAME.monitor --sout "#transcode{acodec=mpga,ab=128,channels=2}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}" --sout-keep &
         RTSP_VLC_PID=$!
     fi
     
     if [ "$ENABLE_STREAMING" = true ] && [ -n "$HTTP_PORT" ] && [ -n "$HTTP_VLC_PID" ] && ! ps -p "$HTTP_VLC_PID" >/dev/null 2>&1; then
         echo "HTTP streaming terminated unexpectedly. Restarting..."
-        cvlc -vvv pulse://ts_music_sink.monitor --sout "#transcode{vcodec=theo,vb=800,acodec=vorb,ab=128,channels=2}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}" --sout-keep &
+        cvlc -vvv pulse://$SINK_NAME.monitor --sout "#transcode{vcodec=theo,vb=800,acodec=vorb,ab=128,channels=2}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}" --sout-keep &
         HTTP_VLC_PID=$!
     fi
     
