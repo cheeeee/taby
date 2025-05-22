@@ -3,7 +3,7 @@
 # TeamSpeak YouTube Audio Streamer
 # Usage: ./taby.sh <youtube_url> [options]
 # Author: [Your Name]
-# Version: 1.1.0
+# Version: 1.3.0 (Added --volume option)
 
 set -o pipefail  # Properly propagate errors in pipelines
 
@@ -23,16 +23,71 @@ AUDIO_QUALITY="bestaudio"
 STREAM_BITRATE="128"
 STREAM_CODEC="mp3"
 YT_DLP_TIMEOUT=60  # Timeout in seconds for yt-dlp
+SINK_VOLUME="100"  # Default sink volume percentage
+
+# Function to start a VLC instance
+# Arguments:
+# 1: Instance type (for logging, e.g., "main", "rtsp", "http")
+# 2: Input source (e.g., stream URL or PulseAudio monitor)
+# 3: VLC sout string (e.g., "#transcode{...}:rtp{...}" or empty for main player)
+# 4: Extra cvlc options (e.g., "--no-video --volume=256")
+# 5: Variable name to store the PID (e.g., VLC_PID, RTSP_VLC_PID)
+# Returns: Sets the global PID variable named by $5. Function itself returns 0 for success, 1 for failure.
+start_vlc_instance() {
+    local instance_type="$1"
+    local input_source="$2"
+    local sout_string="$3"
+    local extra_options="$4"
+    local pid_var_name="$5"
+    local vlc_full_command # For constructing the command
+    local new_pid
+
+    echo "Attempting to start VLC instance: $instance_type..."
+
+    vlc_full_command="cvlc -vvv" # Start with verbose logging for cvlc itself
+
+    if [[ -n "$extra_options" ]]; then
+        vlc_full_command="$vlc_full_command $extra_options"
+    fi
+
+    # For the main player, PULSE_SINK needs to be set if playing a URL
+    if [[ "$instance_type" == "main" && "$input_source" != pulse://* ]]; then
+        vlc_full_command="PULSE_SINK=$SINK_NAME $vlc_full_command"
+    fi
+    
+    vlc_full_command="$vlc_full_command \"$input_source\"" # Add input source
+
+    if [[ -n "$sout_string" ]]; then
+        vlc_full_command="$vlc_full_command --sout \"$sout_string\"" # Add sout string if present
+    fi
+
+    echo "Executing VLC command for '$instance_type': $vlc_full_command &>/dev/null &"
+    eval "$vlc_full_command &>/dev/null &" # Execute in background
+    new_pid=$!
+    
+    eval "$pid_var_name=$new_pid" # Assign PID to the global variable
+
+    sleep 0.5 # Brief pause to allow process to potentially fail
+    if ! ps -p "$new_pid" > /dev/null 2>&1; then
+        echo "ERROR: VLC instance '$instance_type' (tried PID: $new_pid) failed to start or exited immediately."
+        eval "$pid_var_name=''" # Clear PID as it's invalid
+        return 1 # Failure
+    else
+        echo "VLC instance '$instance_type' started successfully (PID: $new_pid)."
+        return 0 # Success
+    fi
+}
 
 # Parse arguments
 [[ "$1" == "-h" || "$1" == "--help" || -z "$1" ]] && {
-    echo "Usage: $0 <youtube_url> [--rtsp-port PORT] [--http-port PORT] [--no-streaming] [--sink-name NAME] [--source-name NAME] [--audio-quality QUALITY] [--stream-bitrate BITRATE] [--stream-codec CODEC]"
+    echo "Usage: $0 <youtube_url> [--rtsp-port PORT] [--http-port PORT] [--no-streaming] [--sink-name NAME] [--source-name NAME] [--audio-quality QUALITY] [--stream-bitrate BITRATE] [--stream-codec CODEC] [--volume PERCENTAGE]"
     echo "Options:"
     echo "  --audio-quality QUALITY    Audio quality for yt-dlp (e.g., 'bestaudio', 'bestaudio[ext=m4a]', 'bestaudio[height<=480]')"
     echo "  --stream-bitrate BITRATE   Bitrate for HTTP/RTSP streaming in kb/s (default: 128)"
     echo "  --stream-codec CODEC       Audio codec for streaming (default: mp3, options: mp3, opus, vorb, flac)"
     echo "  --sink-name NAME           PulseAudio sink name (max 15 chars, default: ts_music_sink)"
     echo "  --source-name NAME         PulseAudio source name (max 15 chars, default: TS_Music_Bot)"
+    echo "  --volume PERCENTAGE        Set sink volume percentage (0-150, default: 100)"
     exit 1
 }
 
@@ -101,6 +156,15 @@ while [[ $# -gt 0 ]]; do
                 *) echo "ERROR: Unsupported codec. Use mp3, opus, vorb, or flac"; exit 1 ;;
             esac
             ;;
+        --volume)
+            if [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge 0 ] && [ "$2" -le 150 ]; then
+                SINK_VOLUME="$2"
+            else
+                echo "ERROR: Invalid volume percentage. Must be a number between 0-150"
+                exit 1
+            fi
+            shift 2
+            ;;
         *) echo "ERROR: Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -108,6 +172,7 @@ done
 echo "Setting up audio pipeline for: $YOUTUBE_URL"
 echo "Audio quality: $AUDIO_QUALITY"
 echo "Stream settings: codec=$STREAM_CODEC, bitrate=$STREAM_BITRATE kb/s"
+echo "Sink volume: $SINK_VOLUME%"
 
 # Create virtual audio devices
 echo "Creating virtual audio devices..."
@@ -181,57 +246,52 @@ if [[ -z "$STREAM_URL" ]]; then
 fi
 
 echo "Starting main audio player..."
-PULSE_SINK=$SINK_NAME cvlc --no-video --volume=256 "$STREAM_URL" &>/dev/null &
-VLC_PID=$!
+# Args: type, input, sout_string, extra_options, pid_var_name
+start_vlc_instance "main" "$STREAM_URL" "" "--no-video --volume=256" "VLC_PID"
+if [[ -z "$VLC_PID" ]]; then
+    echo "ERROR: Main VLC player failed to start critical process."
+    cleanup # cleanup will exit
+fi
 
-# Wait for VLC to initialize
-echo "Waiting for VLC to initialize..."
-for i in {1..10}; do
+# Wait for VLC to initialize (main player might need a bit longer)
+echo "Waiting for main VLC player to initialize..."
+for i in {1..10}; do # Check for ~5 seconds
     if ! ps -p "$VLC_PID" &>/dev/null; then
-        echo "ERROR: VLC failed to start"
+        echo "ERROR: Main VLC player process (PID: $VLC_PID) disappeared unexpectedly after start."
         cleanup
     fi
     sleep 0.5
 done
+echo "Main VLC player assumed to be initialized."
 
 # Set volume levels
 echo "Setting volume levels..."
-pactl set-sink-volume $SINK_NAME 100%
+pactl set-sink-volume $SINK_NAME ${SINK_VOLUME}%
 pactl set-source-volume $SOURCE_NAME 100%
 
 # Start RTSP streaming if enabled
 if [[ -n "$RTSP_PORT" ]]; then
     echo "Starting RTSP server on port $RTSP_PORT..."
-    cvlc -vvv pulse://$SINK_NAME.monitor \
-        --sout "#transcode{acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}" \
-        --sout-keep &>/dev/null &
-    RTSP_VLC_PID=$!
-    
-    # Verify RTSP server started
-    sleep 2
-    if ! ps -p "$RTSP_VLC_PID" &>/dev/null; then
-        echo "WARNING: RTSP server failed to start"
-        RTSP_VLC_PID=""
-    else
+    RTSP_SOUT_STRING="#transcode{acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}"
+    # Args: type, input, sout_string, extra_options, pid_var_name
+    start_vlc_instance "rtsp" "pulse://$SINK_NAME.monitor" "$RTSP_SOUT_STRING" "--sout-keep" "RTSP_VLC_PID"
+    if [[ -n "$RTSP_VLC_PID" ]]; then
         echo "RTSP: rtsp://$LOCAL_IP:$RTSP_PORT$RTSP_PATH"
+    else
+        echo "WARNING: RTSP server failed to start (PID variable RTSP_VLC_PID is empty)."
     fi
 fi
 
 # Start HTTP streaming if enabled
 if [[ -n "$HTTP_PORT" ]]; then
     echo "Starting HTTP server on port $HTTP_PORT..."
-    cvlc -vvv pulse://$SINK_NAME.monitor \
-        --sout "#transcode{vcodec=none,acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}" \
-        --sout-keep &>/dev/null &
-    HTTP_VLC_PID=$!
-    
-    # Verify HTTP server started
-    sleep 2
-    if ! ps -p "$HTTP_VLC_PID" &>/dev/null; then
-        echo "WARNING: HTTP server failed to start"
-        HTTP_VLC_PID=""
-    else
+    HTTP_SOUT_STRING="#transcode{vcodec=none,acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}"
+    # Args: type, input, sout_string, extra_options, pid_var_name
+    start_vlc_instance "http" "pulse://$SINK_NAME.monitor" "$HTTP_SOUT_STRING" "--sout-keep" "HTTP_VLC_PID"
+    if [[ -n "$HTTP_VLC_PID" ]]; then
         echo "HTTP: http://$LOCAL_IP:$HTTP_PORT/stream.ogg"
+    else
+        echo "WARNING: HTTP server failed to start (PID variable HTTP_VLC_PID is empty)."
     fi
 fi
 
@@ -240,27 +300,45 @@ echo "Press Ctrl+C to stop"
 
 # Monitor all processes
 while true; do
-    # Check if main VLC process is still running
     if ! ps -p "$VLC_PID" &>/dev/null; then
-        echo "Main VLC process terminated"
-        break
+        echo "Main VLC process (PID: $VLC_PID) terminated."
+        break # Exit loop, script will then cleanup and exit
     fi
     
-    # Check streaming processes if they were started
-    if [[ -n "$RTSP_VLC_PID" ]] && ! ps -p "$RTSP_VLC_PID" &>/dev/null; then
-        echo "WARNING: RTSP streaming process terminated, restarting..."
-        cvlc -vvv pulse://$SINK_NAME.monitor \
-            --sout "#transcode{acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}" \
-            --sout-keep &>/dev/null &
-        RTSP_VLC_PID=$!
+    # Check and restart RTSP if enabled and not running
+    if [[ -n "$RTSP_PORT" ]]; then # Only if RTSP was meant to be running
+        if [[ -z "$RTSP_VLC_PID" ]] || ! ps -p "$RTSP_VLC_PID" &>/dev/null; then
+            if [[ -n "$RTSP_VLC_PID" ]]; then # It was running and died
+                echo "WARNING: RTSP streaming process (PID $RTSP_VLC_PID) terminated, restarting..."
+            else # It failed to start initially or PID was cleared
+                echo "WARNING: RTSP streaming process not running, attempting to start..."
+            fi
+            RTSP_SOUT_STRING="#transcode{acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:rtp{sdp=rtsp://:$RTSP_PORT$RTSP_PATH}"
+            start_vlc_instance "rtsp_restart" "pulse://$SINK_NAME.monitor" "$RTSP_SOUT_STRING" "--sout-keep" "RTSP_VLC_PID"
+            if [[ -n "$RTSP_VLC_PID" ]]; then
+                echo "RTSP Stream restarted/started successfully (PID: $RTSP_VLC_PID)."
+            else
+                echo "ERROR: Failed to restart/start RTSP stream. Will retry."
+            fi
+        fi
     fi
     
-    if [[ -n "$HTTP_VLC_PID" ]] && ! ps -p "$HTTP_VLC_PID" &>/dev/null; then
-        echo "WARNING: HTTP streaming process terminated, restarting..."
-        cvlc -vvv pulse://$SINK_NAME.monitor \
-            --sout "#transcode{vcodec=none,acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}" \
-            --sout-keep &>/dev/null &
-        HTTP_VLC_PID=$!
+    # Check and restart HTTP if enabled and not running
+    if [[ -n "$HTTP_PORT" ]]; then # Only if HTTP was meant to be running
+        if [[ -z "$HTTP_VLC_PID" ]] || ! ps -p "$HTTP_VLC_PID" &>/dev/null; then
+            if [[ -n "$HTTP_VLC_PID" ]]; then # It was running and died
+                echo "WARNING: HTTP streaming process (PID $HTTP_VLC_PID) terminated, restarting..."
+            else # It failed to start initially or PID was cleared
+                echo "WARNING: HTTP streaming process not running, attempting to start..."
+            fi
+            HTTP_SOUT_STRING="#transcode{vcodec=none,acodec=$STREAM_CODEC,ab=$STREAM_BITRATE}:http{mux=ogg,dst=:$HTTP_PORT/stream.ogg}"
+            start_vlc_instance "http_restart" "pulse://$SINK_NAME.monitor" "$HTTP_SOUT_STRING" "--sout-keep" "HTTP_VLC_PID"
+            if [[ -n "$HTTP_VLC_PID" ]]; then
+                echo "HTTP Stream restarted/started successfully (PID: $HTTP_VLC_PID)."
+            else
+                echo "ERROR: Failed to restart/start HTTP stream. Will retry."
+            fi
+        fi
     fi
     
     sleep 2

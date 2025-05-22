@@ -1,57 +1,143 @@
 #!/usr/bin/env python3
 
-import argparse, os, subprocess, signal, sqlite3, sys, time, re, socket
+import argparse, os, subprocess, signal, sqlite3, sys, time, re, socket, json, shutil
 from datetime import datetime
+
+controller_instance = None
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        # For development, assume the script is in the project root or similar
+        # Adjust if your script structure is different. This assumes taby_controller.py
+        # and taby.sh are in the same directory when run from source.
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, relative_path)
+
+def check_controller_dependencies(script_path_to_check):
+    """Checks for essential CLI tools for headless/controller operation."""
+    missing_tools = []
+    cli_tools_to_check = ['pactl', 'cvlc', 'yt-dlp'] 
+    for tool in cli_tools_to_check:
+        if shutil.which(tool) is None:
+            missing_tools.append(tool)
+    
+    # Check if the taby.sh script itself is found and executable
+    # When running bundled, script_path_to_check might be the original relative path.
+    # The actual execution will use the resource_path resolved path.
+    # This check is more for "source" runs or if the bundled path is passed.
+    actual_script_path = script_path_to_check # Assume it's correct for this check context
+    if hasattr(sys, '_MEIPASS'): # If running in a PyInstaller bundle
+        # The script_path_to_check passed from main might be "./taby.sh"
+        # The actual bundled taby.sh will be at resource_path("taby.sh")
+        # We need to ensure the *original* name passed to Popen will be found by PyInstaller's bundling.
+        # The check here is for the source/dev case. The bundling itself ensures it's there.
+        # For the frozen app, this check might be less relevant if resource_path handles it.
+        # However, if TabyController is run directly (not via GUI), script_path_to_check is what's used.
+        pass # The real check is whether Popen can find it using the resolved path later.
+
+    if not (os.path.isfile(actual_script_path) and os.access(actual_script_path, os.X_OK)):
+        # If we are in a bundle, this check might be misleading if actual_script_path is "./taby.sh"
+        # because the current working directory might not be sys._MEIPASS.
+        # The crucial check is that self.settings["script"] in TabyController becomes valid.
+        if not hasattr(sys, '_MEIPASS'): # Only critical if not bundled, as bundling handles it
+             missing_tools.append(f"Taby script '{actual_script_path}' (not found or not executable from perspective of taby_controller.py)")
+
+
+    if missing_tools:
+        print("--------------------------------------------------------------------")
+        print("ERROR: Missing essential dependencies for Taby Controller:")
+        for tool in missing_tools:
+            print(f"  - {tool}")
+        print("\nPlease run 'sudo ./install.sh' or install/configure them manually.")
+        print("Ensure taby.sh is present and executable if listed above.")
+        print("--------------------------------------------------------------------")
+        return False
+    return True
 
 class TabyController:
     def __init__(self, args):
-        self.settings = {k: getattr(args, k, None) for k in ["script", "rtsp_base_port", "http_base_port", 
-            "port_increment", "max_concurrent", "log_dir", "db_file", "audio_quality", 
-            "stream_bitrate", "stream_codec"]}
+        global controller_instance 
+        controller_instance = self 
+
+        settings_keys = [
+            "script", "rtsp_base_port", "http_base_port", "port_increment", 
+            "max_concurrent", "log_dir", "audio_quality",
+            "stream_bitrate", "stream_codec", "stream_volume"
+        ]
+        self.settings = {k: getattr(args, k, None) for k in settings_keys}
+        
+        # Resolve script path for bundled app or dev environment
+        # args.script is the original path (e.g., "./taby.sh")
+        if self.settings.get("script"):
+            self.settings["script"] = resource_path(self.settings["script"])
+        else: # Should not happen if argparse has a default
+            self.settings["script"] = resource_path("taby.sh")
+
+
+        self.settings["db_file"] = ":memory:"
         
         os.makedirs(self.settings["log_dir"], exist_ok=True)
-        self.init_db()
+        self.init_db() 
         self.queue = self.load_queue()
         
         if hasattr(args, 'url') and args.url:
-            for url in args.url:
-                self.add_to_queue(url)
+            for url_arg in args.url:
+                self.add_to_queue(url_arg) 
         
         if hasattr(args, 'playlist') and args.playlist:
             self.load_playlist(args.playlist)
             
-        self.instances = self.load_instances()
-        self.next_instance_id = max([i["id"] for i in self.instances], default=0) + 1
+        self.instances = self.load_instances() 
+        self.next_instance_id = 1 
         self.clean_instances()
         self.print_status()
-    
+        self._shutting_down = False
+
+    # ... (rest of the TabyController methods remain the same) ...
     def db_op(self, query, params=(), fetch=False):
         with sqlite3.connect(self.settings["db_file"]) as conn:
+            conn.row_factory = sqlite3.Row 
             c = conn.cursor()
             c.execute(query, params)
             return c.fetchall() if fetch else (c.lastrowid if query.lstrip().upper().startswith("INSERT") else None)
     
     def init_db(self):
-        self.db_op('CREATE TABLE IF NOT EXISTS queue (id INTEGER PRIMARY KEY, url TEXT NOT NULL, added_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
-        self.db_op('CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY, url TEXT NOT NULL, rtsp_port INTEGER, http_port INTEGER, sink_name TEXT, source_name TEXT, pid INTEGER, started_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
-    
+        self.db_op('CREATE TABLE IF NOT EXISTS queue (id INTEGER PRIMARY KEY, url TEXT NOT NULL, options TEXT, added_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
+        self.db_op('CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY, url TEXT NOT NULL, rtsp_port INTEGER, http_port INTEGER, sink_name TEXT, source_name TEXT, pid INTEGER, started_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, options TEXT)')
+
     def load_queue(self):
-        return [{"id": r[0], "url": r[1]} for r in self.db_op("SELECT id, url FROM queue ORDER BY id", fetch=True)]
+        queue_data = []
+        for r in self.db_op("SELECT id, url, options FROM queue ORDER BY id", fetch=True):
+            item_options = json.loads(r["options"]) if r["options"] else {}
+            queue_data.append({"id": r["id"], "url": r["url"], "options": item_options})
+        return queue_data
     
     def load_instances(self):
-        return [{"id": r[0], "url": r[1], "rtsp_port": r[2], "http_port": r[3], "sink_name": r[4], "source_name": r[5], "pid": r[6]} 
-                for r in self.db_op("SELECT id, url, rtsp_port, http_port, sink_name, source_name, pid FROM instances", fetch=True)]
-    
-    def add_to_queue(self, url):
+        loaded_instances = []
+        for r in self.db_op("SELECT id, url, rtsp_port, http_port, sink_name, source_name, pid, options FROM instances", fetch=True):
+            instance_options = json.loads(r["options"]) if r["options"] else {}
+            loaded_instances.append({
+                "id": r["id"], "url": r["url"], "rtsp_port": r["rtsp_port"], 
+                "http_port": r["http_port"], "sink_name": r["sink_name"], 
+                "source_name": r["source_name"], "pid": r["pid"], "options": instance_options
+            })
+        return loaded_instances
+
+    def add_to_queue(self, url, options=None):
         if not url.startswith(('http://', 'https://')):
-            print(f"Invalid URL format: {url}")
-            return False
-            
-        queue_id = self.db_op("INSERT INTO queue (url) VALUES (?)", (url,))
-        self.queue.append({"id": queue_id, "url": url})
-        print(f"Added to queue: {url}")
-        return True
-    
+            print(f"Invalid URL format: {url}"); return False
+        current_options = options if options else {}
+        options_json = json.dumps(current_options)
+        queue_id = self.db_op("INSERT INTO queue (url, options) VALUES (?, ?)", (url, options_json))
+        if queue_id is not None:
+            self.queue.append({"id": queue_id, "url": url, "options": current_options})
+            print(f"Added to queue: {url} with options: {current_options}"); return True
+        else: print(f"Failed to add to queue: {url}"); return False
+
     def remove_from_queue(self, queue_id):
         self.db_op("DELETE FROM queue WHERE id = ?", (queue_id,))
         self.queue = [item for item in self.queue if item["id"] != queue_id]
@@ -61,219 +147,287 @@ class TabyController:
             with open(playlist_file, 'r') as f:
                 for line in f:
                     url = line.strip()
-                    if url and not url.startswith('#'):
-                        self.add_to_queue(url)
+                    if url and not url.startswith('#'): self.add_to_queue(url) 
             print(f"Loaded {playlist_file}")
-        except Exception as e:
-            print(f"Error loading playlist: {e}")
+        except FileNotFoundError: print(f"Error: Playlist file not found: {playlist_file}")
+        except Exception as e: print(f"Error loading playlist {playlist_file}: {e}")
     
     def check_port_availability(self, port):
-        """Check if a port is available for use."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             return s.connect_ex(('localhost', port)) != 0
     
     def set_pulseaudio_device_name(self, device_name, description, is_source=False):
         try:
-            # Create a safe description for PulseAudio
             safe_description = re.sub(r'[^\w\s\-_\.,]', '', description).replace(" ", "_")
-            
-            # Create the command with proper quoting
             device_type = "source" if is_source else "sink"
             cmd = f"pacmd update-{device_type}-proplist {device_name} device.description={safe_description}"
-            
-            # Execute the command
             subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
             return True
-        except subprocess.CalledProcessError as e:
-            print(f"PulseAudio command failed: {e.stderr if hasattr(e, 'stderr') else str(e)}")
-            return False
-        except Exception as e:
-            print(f"Error setting device name: {e}")
-            return False
+        except subprocess.CalledProcessError as e: print(f"PA command failed: {e.stderr or e}"); return False
+        except Exception as e: print(f"Error setting device name: {e}"); return False
     
-    def start_taby(self, url, instance_id):
+    def start_taby(self, url, instance_id, 
+                   volume=None, audio_quality=None, stream_bitrate=None, stream_codec=None,
+                   rtsp_port_override=None, http_port_override=None, 
+                   sink_name_override=None, source_name_override=None):
         try:
-            rtsp_port = self.settings["rtsp_base_port"] + (instance_id * self.settings["port_increment"])
-            http_port = self.settings["http_base_port"] + (instance_id * self.settings["port_increment"])
+            rtsp_port = rtsp_port_override if rtsp_port_override is not None else \
+                        self.settings["rtsp_base_port"] + (instance_id * self.settings["port_increment"])
+            http_port = http_port_override if http_port_override is not None else \
+                        self.settings["http_base_port"] + (instance_id * self.settings["port_increment"])
             
-            # Check port availability
             if not self.check_port_availability(rtsp_port):
-                print(f"RTSP port {rtsp_port} is already in use")
-                return False
+                print(f"RTSP port {rtsp_port} is already in use for instance {instance_id}"); return False
             if not self.check_port_availability(http_port):
-                print(f"HTTP port {http_port} is already in use")
-                return False
+                print(f"HTTP port {http_port} is already in use for instance {instance_id}"); return False
                 
-            sink_name = f"ts_sink_{instance_id}"
-            source_name = f"TS_Bot_{instance_id}"
+            sink_name = sink_name_override if sink_name_override else f"ts_sink_{instance_id}"
+            source_name = source_name_override if source_name_override else f"TS_Bot_{instance_id}"
             log_file = os.path.join(self.settings["log_dir"], f"taby_{instance_id}_{int(time.time())}.log")
             
-            print(f"Starting Taby instance {instance_id} for {url}")
+            effective_volume = volume if volume is not None else self.settings.get("stream_volume", 100)
+            effective_audio_quality = audio_quality if audio_quality else self.settings["audio_quality"]
+            effective_bitrate = stream_bitrate if stream_bitrate is not None else self.settings["stream_bitrate"]
+            effective_codec = stream_codec if stream_codec else self.settings["stream_codec"]
+            current_options = { "volume": effective_volume, "audio_quality": effective_audio_quality,
+                "stream_bitrate": effective_bitrate, "stream_codec": effective_codec }
+            options_json = json.dumps(current_options)
+
+            print(f"Starting Taby instance {instance_id} for {url} (Ports: RTSP/{rtsp_port}, HTTP/{http_port}, Sink: {sink_name}) with options: {options_json}")
             
-            # Get video title first
             try:
                 title = subprocess.check_output(["yt-dlp", "--get-title", url], text=True).strip()
-                if len(title) > 30:
-                    title = title[:27] + "..."
-            except Exception as e:
-                print(f"Error getting video title: {e}")
-                title = f"YouTube Stream {instance_id}"
+                title = title[:27] + "..." if len(title) > 30 else title
+            except Exception as e: print(f"Error getting video title for {url}: {e}"); title = f"Stream {instance_id}"
             
-            with open(log_file, 'w') as f:
-                process = subprocess.Popen([
-                    self.settings["script"], url,
-                    "--rtsp-port", str(rtsp_port),
-                    "--http-port", str(http_port),
-                    "--sink-name", sink_name,
-                    "--source-name", source_name,
-                    "--audio-quality", self.settings["audio_quality"],
-                    "--stream-bitrate", str(self.settings["stream_bitrate"]),
-                    "--stream-codec", self.settings["stream_codec"]
-                ], stdout=f, stderr=f)
+            # self.settings["script"] is now the resolved path (either original or from _MEIPASS)
+            script_command = [ self.settings["script"], url, "--rtsp-port", str(rtsp_port), "--http-port", str(http_port),
+                "--sink-name", sink_name, "--source-name", source_name, "--audio-quality", effective_audio_quality,
+                "--stream-bitrate", str(effective_bitrate), "--stream-codec", effective_codec, "--volume", str(effective_volume) ]
+
+            with open(log_file, 'w') as f: process = subprocess.Popen(script_command, stdout=f, stderr=f)
             
-            self.db_op("INSERT INTO instances VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
-                (instance_id, url, rtsp_port, http_port, sink_name, source_name, process.pid))
+            self.db_op("INSERT INTO instances (id, url, rtsp_port, http_port, sink_name, source_name, pid, options) VALUES (?,?,?,?,?,?,?,?)",
+                (instance_id, url, rtsp_port, http_port, sink_name, source_name, process.pid, options_json))
+            self.instances.append({ "id": instance_id, "url": url, "rtsp_port": rtsp_port, "http_port": http_port,
+                "sink_name": sink_name, "source_name": source_name, "pid": process.pid, "options": current_options })
             
-            self.instances.append({
-                "id": instance_id, "url": url, "rtsp_port": rtsp_port, "http_port": http_port,
-                "sink_name": sink_name, "source_name": source_name, "pid": process.pid
-            })
-            
-            # Update PulseAudio device descriptions with video title
-            time.sleep(2)  # Wait for PulseAudio to create the devices
-            try:
-                self.set_pulseaudio_device_name(sink_name, title)
-                self.set_pulseaudio_device_name(f"{sink_name}.monitor", f"Monitor of {title}", True)
-                self.set_pulseaudio_device_name(source_name, title, True)
-                print(f"Updated device names to: {title}")
-            except Exception as e:
-                print(f"Error updating device names: {e}")
-            
+            time.sleep(2) 
+            self.set_pulseaudio_device_name(sink_name, title)
+            self.set_pulseaudio_device_name(f"{sink_name}.monitor", f"Monitor of {title}", True)
+            self.set_pulseaudio_device_name(source_name, title, True)
+            print(f"Updated PA device names for instance {instance_id} to '{title}'")
             return True
+        except FileNotFoundError: # This would be if self.settings["script"] is not found after resource_path
+             print(f"Error: Script '{self.settings['script']}' not found. This might be an issue with bundling or path resolution."); return False
         except Exception as e:
-            print(f"Error starting instance: {e}")
+            print(f"Error starting instance {instance_id} ({url}): {e}")
+            self.db_op("DELETE FROM instances WHERE id = ?", (instance_id,))
+            self.instances = [i for i in self.instances if i["id"] != instance_id]
             return False
     
-    def stop_instance(self, instance_id):
-        instance = next((i for i in self.instances if i["id"] == instance_id), None)
-        if not instance:
-            print(f"Instance {instance_id} not found")
-            return False
-        
-        try:
-            os.kill(instance["pid"], signal.SIGTERM)
-            print(f"Stopped instance {instance_id}")
-        except ProcessLookupError:
-            print(f"Process for instance {instance_id} not found, cleaning up")
-        except Exception as e:
-            print(f"Error stopping instance {instance_id}: {e}")
-            return False
-            
+    def stop_instance(self, instance_id, from_change_url=False): 
+        instance_to_remove = next((i for i in self.instances if i["id"] == instance_id), None)
+        if not instance_to_remove: print(f"Instance {instance_id} not found for stopping."); return False
+        pid = instance_to_remove.get('pid'); log_msg_prefix = f"Instance {instance_id} (PID: {pid or 'N/A'})"
+        if pid:
+            try:
+                print(f"Attempting to stop {log_msg_prefix}..."); os.kill(pid, signal.SIGTERM)
+                print(f"Successfully sent SIGTERM to {log_msg_prefix}.")
+            except ProcessLookupError: print(f"{log_msg_prefix} process not found (already stopped/cleaned up).")
+            except Exception as e: print(f"Error sending SIGTERM to {log_msg_prefix}: {e}")
+        else: print(f"{log_msg_prefix} has no PID, cannot send signal.")
         self.db_op("DELETE FROM instances WHERE id = ?", (instance_id,))
         self.instances = [i for i in self.instances if i["id"] != instance_id]
+        if not from_change_url: print(f"Instance {instance_id} removed from controller records.")
         return True
-    
+
+    def change_instance_url(self, instance_id, new_url, new_options=None):
+        print(f"Attempting to change URL for instance {instance_id} to '{new_url}' with options: {new_options}")
+        if not new_url.startswith(('http://', 'https://')):
+            print(f"Error: Invalid new URL format: {new_url}"); return False
+        original_instance = next((i for i in self.instances if i["id"] == instance_id), None)
+        if not original_instance: print(f"Error: Instance {instance_id} not found."); return False
+        original_rtsp_port = original_instance["rtsp_port"]; original_http_port = original_instance["http_port"]
+        original_sink_name = original_instance["sink_name"]; original_source_name = original_instance["source_name"]
+        combined_options = original_instance.get("options", {}).copy()
+        if new_options: combined_options.update(new_options)
+        print(f"Stopping original instance {instance_id} (URL: {original_instance['url']})...")
+        if not self.stop_instance(instance_id, from_change_url=True):
+            print(f"Warning: Failed to stop original instance {instance_id}, but attempting new one.")
+        print(f"Starting new stream for instance {instance_id} with URL '{new_url}'.")
+        success = self.start_taby(new_url, instance_id, volume=combined_options.get("volume"),
+            audio_quality=combined_options.get("audio_quality"), stream_bitrate=combined_options.get("stream_bitrate"),
+            stream_codec=combined_options.get("stream_codec"), rtsp_port_override=original_rtsp_port,
+            http_port_override=original_http_port, sink_name_override=original_sink_name, source_name_override=original_source_name)
+        if success: print(f"Successfully changed URL for instance {instance_id} to '{new_url}'."); return True
+        else: print(f"Error: Failed to start new stream for instance {instance_id} with '{new_url}'."); return False
+
+    def change_instance_volume(self, instance_id, new_volume):
+        instance = next((i for i in self.instances if i["id"] == instance_id), None)
+        if not instance: print(f"Error: Instance ID {instance_id} not found."); return False
+        sink_name = instance.get("sink_name")
+        if not sink_name: print(f"Error: Sink name for instance ID {instance_id} not found."); return False
+        try:
+            new_volume = int(new_volume)
+            if not (0 <= new_volume <= 150): raise ValueError("Volume: 0-150.")
+        except ValueError as e: print(f"Error: Invalid volume '{new_volume}'. {e}"); return False
+        cmd = ["pactl", "set-sink-volume", sink_name, f"{new_volume}%"]
+        try:
+            print(f"Executing: {' '.join(cmd)}")
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print(f"Volume for {instance_id} (sink: {sink_name}) changed to {new_volume}%. Output: {result.stdout.strip()}")
+            if "options" not in instance: instance["options"] = {}
+            instance["options"]["volume"] = new_volume 
+            self.db_op("UPDATE instances SET options = ? WHERE id = ?", (json.dumps(instance["options"]), instance_id))
+            return True
+        except FileNotFoundError: print(f"Error: 'pactl' not found."); return False
+        except subprocess.CalledProcessError as e: print(f"Error changing volume for {sink_name}: {e.stderr}"); return False
+        except Exception as e: print(f"Unexpected error changing volume: {e}"); return False
+
     def clean_instances(self):
         for instance in list(self.instances):
-            try:
-                os.kill(instance["pid"], 0)
+            pid = instance.get('pid', 'N/A')
+            try: os.kill(instance["pid"], 0) 
             except ProcessLookupError:
-                print(f"Cleaning up dead instance {instance['id']}")
+                print(f"Cleaning dead instance {instance['id']} (PID: {pid}).")
                 self.db_op("DELETE FROM instances WHERE id = ?", (instance["id"],))
                 self.instances = [i for i in self.instances if i["id"] != instance["id"]]
-            except Exception as e:
-                print(f"Error checking instance {instance['id']}: {e}")
+            except Exception as e: print(f"Error checking instance {instance['id']} (PID: {pid}): {e}.")
     
     def start_next(self):
-        if not self.queue:
-            print("Queue is empty")
-            return False
-        
+        if not self.queue: print("Queue empty"); return False
         if len(self.instances) >= self.settings["max_concurrent"]:
-            print(f"Maximum number of concurrent instances ({self.settings['max_concurrent']}) reached")
-            return False
-        
-        # Fixed critical bug: Get the first item from the queue instead of the entire queue
-        next_item = self.queue[0]  # Fixed line - was incorrectly "next_item = self.queue"
-        if self.start_taby(next_item["url"], self.next_instance_id):
-            self.next_instance_id += 1
-            self.remove_from_queue(next_item["id"])
-            return True
+            print(f"Max instances ({self.settings['max_concurrent']}) reached"); return False
+        next_item = self.queue[0]; opts = next_item.get("options", {})
+        if self.start_taby(next_item["url"], self.next_instance_id, volume=opts.get("volume"), 
+                           audio_quality=opts.get("audio_quality"), stream_bitrate=opts.get("stream_bitrate"), 
+                           stream_codec=opts.get("stream_codec")): 
+            self.next_instance_id += 1; self.remove_from_queue(next_item["id"]); return True
         return False
-    
-    def print_status(self):
-        print(f"\n=== Taby Controller Status ===\nActive: {len(self.instances)}/{self.settings['max_concurrent']} | Queue: {len(self.queue)}\n")
-    
+
+    def shutdown(self):
+        if self._shutting_down: print("Shutdown in progress."); return
+        self._shutting_down = True; print("\nShutting down, stopping all instances...")
+        for instance in list(self.instances): self.stop_instance(instance["id"])
+        print("All instances processed. Controller shut down.")
+
+    def print_status(self): print(f"\n=== Status ===\nActive: {len(self.instances)}/{self.settings['max_concurrent']} | Queue: {len(self.queue)}\n")
     def list_instances(self):
-        if not self.instances:
-            print("No active instances")
-            return
-        
+        if not self.instances: print("No active instances"); return
         print("\n=== Active Instances ===")
-        for i in self.instances:
-            print(f"ID: {i['id']}\n  URL: {i['url']}\n  RTSP: rtsp://localhost:{i['rtsp_port']}/audio\n  HTTP: http://localhost:{i['http_port']}/stream.ogg")
-    
+        for i in self.instances: 
+            opts_str = json.dumps(i.get("options", {}))
+            print(f"ID: {i['id']} URL: {i['url']} RTSP: {i['rtsp_port']} HTTP: {i['http_port']} PID: {i['pid']} Sink: {i['sink_name']} Opts: {opts_str}")
     def show_queue(self):
-        print("\n=== Queue ===\n" + "\n".join([f"{i+1}. {item['url']}" for i, item in enumerate(self.queue)] or ["Empty"]) + "\n")
-    
+        if not self.queue: print("\n=== Queue ===\nEmpty\n"); return
+        print("\n=== Queue ==="); 
+        for i, item in enumerate(self.queue):
+            opts_str = json.dumps(item.get('options',{}))
+            print(f"{i+1}. {item['url']}" + (f" (Options: {opts_str})" if opts_str !="{}" else ""))
+        print("")
+
     def interactive_mode(self):
-        print("Taby Controller Interactive Mode\nType 'help' for commands")
-        
-        cmds = {
-            "list": self.list_instances,
-            "queue": self.show_queue,
-            "clean": self.clean_instances,
-            "start-next": self.start_next,
-            "help": lambda: print("\nCommands:\n  list - Show instances\n  queue - Show queue\n  add URL - Add URL\n  clean - Remove dead instances\n  stop ID - Stop instance\n  stop-all - Stop all\n  start-next - Start next\n  exit/quit - Exit\n")
-        }
-        
-        while True:
-            try:
-                cmd = input("> ").strip()
-                if not cmd: continue
-                if cmd in ["exit", "quit"]: break
-                
-                if cmd in cmds:
-                    cmds[cmd]()
-                elif cmd.startswith("stop "):
-                    try: self.stop_instance(int(cmd.split(" ")[1]))
-                    except: print("Invalid instance ID")
-                elif cmd == "stop-all":
-                    for instance in list(self.instances): self.stop_instance(instance["id"])
-                elif cmd.startswith("add "):
-                    self.add_to_queue(cmd[4:].strip())
-                else:
-                    print(f"Unknown command: {cmd}")
-            except KeyboardInterrupt:
-                print("\nUse 'exit' to quit")
-            except Exception as e:
-                print(f"Error: {e}")
+        print("Taby Controller Interactive Mode. Type 'help'.")
+        help_text = ("\nCommands:\n list\n queue\n add <URL> [options_json]\n setvol <ID> <VOL>\n "
+                     "changeurl <ID> <URL> [opts_json]\n clean\n stop <ID>\n stop-all\n start-next\n exit/quit\n help\n")
+        cmds = { "list": self.list_instances, "queue": self.show_queue, "clean": self.clean_instances, 
+                   "start-next": self.start_next, "help": lambda: print(help_text) }
+        try:
+            while True:
+                try:
+                    cmd_input = input("> ").strip(); parts = cmd_input.split(" ", 3); cmd = parts[0]
+                    if not cmd_input: continue
+                    if cmd in ["exit", "quit"]: print("Exiting..."); break
+                    if cmd in cmds:
+                        if cmd == "add" and len(parts) > 1:
+                            opts = None; url_to_add = parts[1]
+                            if len(parts) > 2:
+                                try: opts = json.loads(parts[2])
+                                except json.JSONDecodeError: print(f"Invalid JSON: {parts[2]}"); continue
+                            self.add_to_queue(url_to_add, opts)
+                        elif cmd == "add": print("Usage: add <URL> [options_json]")
+                        else: cmds[cmd]()
+                    elif cmd == "stop":
+                        if len(parts) > 1:
+                            try: self.stop_instance(int(parts[1]))
+                            except ValueError: print(f"Invalid ID: {parts[1]}")
+                        else: print("Usage: stop <ID>")
+                    elif cmd == "stop-all":
+                        print("Stopping all instances..."); 
+                        for i in list(self.instances): self.stop_instance(i["id"])
+                        print("All instances commanded to stop.")
+                    elif cmd == "setvol":
+                        if len(parts) == 3:
+                            try: self.change_instance_volume(int(parts[1]), int(parts[2]))
+                            except ValueError: print("ID and Volume must be integers.")
+                        else: print("Usage: setvol <ID> <VOLUME>")
+                    elif cmd == "changeurl":
+                        if len(parts) >= 3:
+                            opts = None; new_url = parts[2]
+                            if len(parts) > 3: 
+                                try: opts = json.loads(parts[3])
+                                except json.JSONDecodeError: print(f"Invalid JSON: {parts[3]}"); continue
+                            try: self.change_instance_url(int(parts[1]), new_url, opts)
+                            except ValueError: print("Instance ID must be an integer.")
+                        else: print("Usage: changeurl <ID> <NEW_URL> [options_json]")
+                    else: print(f"Unknown command: '{cmd}'. Type 'help'.")
+                except KeyboardInterrupt: print("\nCtrl+C. Type 'exit' or use Ctrl+C again."); continue
+                except Exception as e: print(f"Error in loop: {e}")
+        finally: self.shutdown() 
+
+def signal_handler(sig, frame):
+    print(f"\nSignal {signal.Signals(sig).name} received.")
+    if controller_instance: controller_instance.shutdown()
+    sys.exit(0)
 
 def main():
-    parser = argparse.ArgumentParser(description="Taby Controller - Manage multiple YouTube audio streams")
-    parser.add_argument("-p", "--playlist", help="Load YouTube URLs from a playlist file")
-    parser.add_argument("-u", "--url", action="append", help="Add YouTube URL to queue")
-    parser.add_argument("-s", "--script", default="./taby.sh", help="Path to taby.sh (default: ./taby.sh)")
-    parser.add_argument("-l", "--list", action="store_true", help="List active instances")
-    parser.add_argument("--rtsp-base-port", type=int, default=8554, help="Base RTSP port (default: 8554)")
-    parser.add_argument("--http-base-port", type=int, default=8080, help="Base HTTP port (default: 8080)")
-    parser.add_argument("--port-increment", type=int, default=10, help="Port increment (default: 10)")
-    parser.add_argument("--max-concurrent", type=int, default=5, help="Max instances (default: 5)")
-    parser.add_argument("--log-dir", default="/tmp/taby-controller-logs", help="Log directory")
-    parser.add_argument("--db-file", default="/tmp/taby-controller.db", help="Database file")
-    parser.add_argument("--audio-quality", default="bestaudio", help="Audio quality (default: bestaudio)")
-    parser.add_argument("--stream-bitrate", type=int, default=128, help="Stream bitrate (default: 128)")
-    parser.add_argument("--stream-codec", default="mp3", help="Stream codec (default: mp3)")
+    parser = argparse.ArgumentParser(description="Taby Controller")
+    # Default script path determination
+    # When running from source, __file__ is taby_controller.py
+    # When bundled by PyInstaller and running the executable, sys.executable might be more relevant
+    # or resource_path can find it if bundled relative to the executable.
+    # For now, default assumes taby.sh is in the same dir as taby_controller.py (source)
+    # or at the root of the bundle (handled by resource_path in __init__).
+    default_script_path_for_argparse = "./taby.sh"
+    if not hasattr(sys, "_MEIPASS"): # Not bundled
+        default_script_path_for_argparse = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taby.sh")
     
-    args = parser.parse_args()
-    controller = TabyController(args)
+    parser.add_argument("-s", "--script", default=default_script_path_for_argparse, help="Path to taby.sh")
     
-    if args.list:
-        controller.list_instances()
-        return
+    args_temp, _ = parser.parse_known_args() # Parse just for script path to pass to check
+
+    # Perform dependency check using the potentially user-supplied script path
+    if not check_controller_dependencies(args_temp.script):
+        sys.exit(1)
+
+    # Add other arguments now that basic dependency check passed
+    parser.add_argument("-p", "--playlist", help="Load playlist file")
+    parser.add_argument("-u", "--url", action="append", help="Add URL to queue")
+    parser.add_argument("-l", "--list", action="store_true", help="List and exit")
+    parser.add_argument("--rtsp-base-port", type=int, default=8554)
+    parser.add_argument("--http-base-port", type=int, default=8080)
+    parser.add_argument("--port-increment", type=int, default=10)
+    parser.add_argument("--max-concurrent", type=int, default=5)
+    parser.add_argument("--log-dir", default="/tmp/taby-controller-logs")
+    parser.add_argument("--audio-quality", default="bestaudio")
+    parser.add_argument("--stream-bitrate", type=int, default=128)
+    parser.add_argument("--stream-codec", default="mp3", choices=['mp3','opus','vorb','flac'])
+    parser.add_argument("--stream-volume", type=int, default=100)
     
-    while len(controller.instances) < controller.settings["max_concurrent"] and controller.queue:
-        controller.start_next()
+    args = parser.parse_args() # Full parse
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    controller = TabyController(args) # Controller init will resolve self.settings["script"] via resource_path
+    
+    if args.list: controller.list_instances(); controller.show_queue(); return
+    
+    active_count = len(controller.instances)
+    while active_count < controller.settings["max_concurrent"] and controller.queue:
+        if not controller.start_next(): print("Could not start initial item."); break 
+        active_count = len(controller.instances)
     
     controller.interactive_mode()
 
